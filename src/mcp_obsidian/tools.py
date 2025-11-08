@@ -8,6 +8,7 @@ from mcp.types import (
 import json
 import os
 from . import obsidian
+from . import excalidraw
 
 api_key = os.getenv("OBSIDIAN_API_KEY", "")
 obsidian_host = os.getenv("OBSIDIAN_HOST", "127.0.0.1")
@@ -629,13 +630,31 @@ class RecentChangesToolHandler(ToolHandler):
 
 
 class SaveExcalidrawToolHandler(ToolHandler):
+    # Maximum number of elements allowed for reliable saving
+    MAX_ELEMENTS = 100
+    
+    # Element types that are well-supported (mainly flowchart elements)
+    SUPPORTED_ELEMENT_TYPES = {
+        'rectangle', 'diamond', 'ellipse',  # Shapes for flowchart nodes
+        'arrow', 'line',                     # Connectors
+        'text'                               # Labels and text
+    }
+    
     def __init__(self):
         super().__init__("obsidian_save_excalidraw")
 
     def get_tool_description(self):
         return Tool(
             name=self.name,
-            description="Save Excalidraw elements to an Obsidian note using the Excalidraw plugin template format. Takes JSON elements from Excalidraw MCP query and creates/updates an Obsidian Excalidraw note.",
+            description=(
+                "Save Excalidraw elements to an Obsidian note using the Excalidraw plugin template format. "
+                "Takes JSON elements from Excalidraw MCP query and creates/updates an Obsidian Excalidraw note.\n\n"
+                f"⚠️ RESTRICTIONS:\n"
+                f"- Maximum {self.MAX_ELEMENTS} elements allowed\n"
+                f"- Best suited for flowcharts and simple diagrams\n"
+                f"- Supported element types: {', '.join(sorted(self.SUPPORTED_ELEMENT_TYPES))}\n"
+                f"- Complex drawings with many elements may not save correctly"
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -646,7 +665,10 @@ class SaveExcalidrawToolHandler(ToolHandler):
                     },
                     "elements": {
                         "type": "array",
-                        "description": "Array of Excalidraw element objects to save. This is the 'elements' array from Excalidraw.",
+                        "description": (
+                            "Array of Excalidraw element objects to save. This is the 'elements' array from Excalidraw. "
+                            f"Maximum {self.MAX_ELEMENTS} elements allowed."
+                        ),
                         "items": {
                             "type": "object"
                         }
@@ -675,273 +697,74 @@ class SaveExcalidrawToolHandler(ToolHandler):
         if "filepath" not in args or "elements" not in args:
             raise ValueError("filepath and elements are required")
 
-        filepath = args["filepath"]
+        filepath = self._normalize_filepath(args["filepath"])
         elements = args["elements"]
-        appState = args.get("appState")
+        
+        # Validate number of elements
+        if len(elements) > self.MAX_ELEMENTS:
+            raise ValueError(
+                f"Too many elements: {len(elements)}. "
+                f"Maximum allowed is {self.MAX_ELEMENTS} elements. "
+                f"This tool works best with simple flowcharts and diagrams. "
+                f"Consider simplifying your diagram or splitting it into multiple files."
+            )
+        
+        # Check element types and provide warnings
+        unsupported_types = set()
+        element_type_counts = {}
+        
+        for element in elements:
+            element_type = element.get('type', 'unknown')
+            element_type_counts[element_type] = element_type_counts.get(element_type, 0) + 1
+            
+            if element_type not in self.SUPPORTED_ELEMENT_TYPES:
+                unsupported_types.add(element_type)
+        
+        # Generate warning message if there are unsupported types
+        warning_message = ""
+        if unsupported_types:
+            warning_message = (
+                f"\n⚠️ Warning: Found unsupported element types: {', '.join(sorted(unsupported_types))}. "
+                f"These may not save correctly. Supported types are: {', '.join(sorted(self.SUPPORTED_ELEMENT_TYPES))}"
+            )
+        
+        app_state = args.get("appState")
         frontmatter = args.get("frontmatter", {})
         text_elements = args.get("text_elements", "")
 
-        # Ensure filepath ends with .excalidraw.md
+        # Build the Excalidraw note content using the new module
+        content = excalidraw.build_excalidraw_note(
+            elements=elements,
+            app_state=app_state,
+            frontmatter=frontmatter,
+            text_elements=text_elements
+        )
+
+        # Save to Obsidian
+        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
+        api.put_content(filepath, content)
+        
+        # Build summary of element types
+        type_summary = ", ".join([f"{count} {type}" for type, count in sorted(element_type_counts.items())])
+
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    f"Successfully saved Excalidraw drawing to {filepath}\n"
+                    f"Total elements: {len(elements)}\n"
+                    f"Element types: {type_summary}"
+                    f"{warning_message}"
+                )
+            )
+        ]
+
+    @staticmethod
+    def _normalize_filepath(filepath: str) -> str:
+        """Ensure filepath ends with .excalidraw.md extension."""
         if not filepath.endswith(".excalidraw.md"):
             if filepath.endswith(".md"):
                 filepath = filepath.replace(".md", ".excalidraw.md")
             else:
                 filepath = f"{filepath}.excalidraw.md"
-
-        # Build the Excalidraw note content
-        content = self._build_excalidraw_note(elements, appState, frontmatter, text_elements)
-
-        # Save to Obsidian
-        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-        api.put_content(filepath, content)
-
-        return [
-            TextContent(
-                type="text",
-                text=f"Successfully saved Excalidraw drawing to {filepath} with {len(elements)} elements"
-            )
-        ]
-
-    def _build_excalidraw_note(self, elements: list, appState: dict | None, frontmatter: dict, text_elements: str) -> str:
-        """Build the complete Excalidraw note content following Obsidian Excalidraw plugin format."""
-        
-        # Merge frontmatter with required Excalidraw fields
-        final_frontmatter = {
-            "excalidraw-plugin": "parsed",
-            "tags": frontmatter.get("tags", ["excalidraw"]),
-            **frontmatter
-        }
-
-        # Build default appState if not provided
-        if appState is None:
-            appState = {
-                "theme": "light",
-                "viewBackgroundColor": "#ffffff",
-                "currentItemStrokeColor": "#1e1e1e",
-                "currentItemBackgroundColor": "transparent",
-                "currentItemFillStyle": "solid",
-                "currentItemStrokeWidth": 2,
-                "currentItemStrokeStyle": "solid",
-                "currentItemRoughness": 1,
-                "currentItemOpacity": 100,
-                "currentItemFontFamily": 1,
-                "currentItemFontSize": 20,
-                "currentItemTextAlign": "left",
-                "currentItemStartArrowhead": None,
-                "currentItemEndArrowhead": "arrow",
-                "scrollX": 0,
-                "scrollY": 0,
-                "zoom": {"value": 1},
-                "currentItemRoundness": "round",
-                "gridSize": None,
-                "gridColor": {
-                    "Bold": "#C9C9C9FF",
-                    "Regular": "#EDEDEDFF"
-                },
-                "currentStrokeOptions": None,
-                "previousGridSize": None,
-                "frameRendering": {
-                    "enabled": True,
-                    "clip": True,
-                    "name": True,
-                    "outline": True
-                }
-            }
-
-        # Extract text elements from the elements array
-        # Look for elements with 'text' field or elements with 'label' containing text
-        extracted_texts = []
-        if not text_elements:
-            for element in elements:
-                text_content = None
-                
-                # Check for direct text field (for text elements)
-                if "text" in element and element.get("text"):
-                    text_content = element["text"]
-                # Check for label field (for shapes with labels like rectangles, ellipses, etc.)
-                elif "label" in element and isinstance(element["label"], dict):
-                    text_content = element["label"].get("text", "")
-                elif "label" in element and isinstance(element["label"], str):
-                    text_content = element["label"]
-                
-                # Add to extracted texts if we found any text
-                if text_content and text_content.strip():
-                    # Generate a unique block reference ID (8 characters alphanumeric)
-                    import random
-                    import string
-                    block_id = ''.join(random.choices(string.ascii_uppercase + string.ascii_lowercase + string.digits, k=8))
-                    extracted_texts.append(f"{text_content} ^{block_id}")
-            
-            # Join all extracted texts with double newlines (blank line between each)
-            text_elements = "\n\n".join(extracted_texts) if extracted_texts else ""
-
-        # Ensure all elements have required Excalidraw fields and create text elements for labels
-        processed_elements = []
-        import random
-        import string
-        
-        for element in elements:
-            # Create a copy with all required fields
-            element_id = element.get("id", "")
-            processed_element = {
-                "id": element_id,
-                "type": element.get("type", ""),
-                "x": element.get("x", 0),
-                "y": element.get("y", 0),
-                "width": element.get("width", 0),
-                "height": element.get("height", 0),
-                "angle": element.get("angle", 0),
-                "strokeColor": element.get("strokeColor", "#1e1e1e"),
-                "backgroundColor": element.get("backgroundColor", "transparent"),
-                "fillStyle": element.get("fillStyle", "solid"),
-                "strokeWidth": element.get("strokeWidth", 2),
-                "strokeStyle": element.get("strokeStyle", "solid"),
-                "roughness": element.get("roughness", 1),
-                "opacity": element.get("opacity", 100),
-                "groupIds": element.get("groupIds", []),
-                "frameId": element.get("frameId", None),
-                "roundness": element.get("roundness", None),
-                "seed": element.get("seed", 1),
-                "version": element.get("version", 1),
-                "versionNonce": element.get("versionNonce", 1),
-                "isDeleted": element.get("isDeleted", False),
-                "boundElements": element.get("boundElements", []),
-                "updated": element.get("updated", 1),
-                "link": element.get("link", None),
-                "locked": element.get("locked", False),
-            }
-            
-            # Add type-specific fields
-            if element.get("type") == "arrow" or element.get("type") == "line":
-                processed_element["points"] = element.get("points", [[0, 0], [element.get("width", 100), element.get("height", 0)]])
-                processed_element["lastCommittedPoint"] = element.get("lastCommittedPoint", None)
-                processed_element["startBinding"] = element.get("startBinding", None)
-                processed_element["endBinding"] = element.get("endBinding", None)
-                processed_element["startArrowhead"] = element.get("startArrowhead", None)
-                processed_element["endArrowhead"] = element.get("endArrowhead", "arrow")
-            
-            # Handle labels by creating separate text elements
-            if "label" in element and element["label"]:
-                label_text = element["label"].get("text", "") if isinstance(element["label"], dict) else element["label"]
-                
-                # Replace HTML <br> tags with actual newlines
-                if label_text:
-                    label_text = label_text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-                
-                if label_text:
-                    # Generate unique ID for text element
-                    text_id = ''.join(random.choices(string.ascii_uppercase + string.ascii_lowercase + string.digits, k=8))
-                    
-                    # Calculate text position (centered in the container)
-                    font_size = element.get("fontSize", 20)
-                    # Approximate text width (rough estimate)
-                    text_width = len(label_text) * font_size * 0.6
-                    text_height = font_size * 1.25
-                    
-                    text_x = element.get("x", 0) + (element.get("width", 0) - text_width) / 2
-                    text_y = element.get("y", 0) + (element.get("height", 0) - text_height) / 2
-                    
-                    # Add boundElement to container
-                    processed_element["boundElements"] = [{"type": "text", "id": text_id}]
-                    
-                    # Create text element
-                    text_element = {
-                        "id": text_id,
-                        "type": "text",
-                        "x": text_x,
-                        "y": text_y,
-                        "width": text_width,
-                        "height": text_height,
-                        "angle": 0,
-                        "strokeColor": element.get("strokeColor", "#1e1e1e"),
-                        "backgroundColor": "transparent",
-                        "fillStyle": "solid",
-                        "strokeWidth": 2,
-                        "strokeStyle": "solid",
-                        "roughness": 1,
-                        "opacity": 100,
-                        "groupIds": [],
-                        "frameId": None,
-                        "roundness": None,
-                        "seed": 1,
-                        "version": 1,
-                        "versionNonce": 1,
-                        "isDeleted": False,
-                        "boundElements": [],
-                        "updated": 1,
-                        "link": None,
-                        "locked": False,
-                        "text": label_text,
-                        "fontSize": font_size,
-                        "fontFamily": element.get("fontFamily", 1),
-                        "textAlign": "center",
-                        "verticalAlign": "middle",
-                        "containerId": element_id,
-                        "originalText": label_text,
-                        "autoResize": True,
-                        "lineHeight": 1.25
-                    }
-                    
-                    # Add both container and text elements
-                    processed_elements.append(processed_element)
-                    processed_elements.append(text_element)
-                else:
-                    processed_elements.append(processed_element)
-            # Handle direct text elements
-            elif "text" in element:
-                processed_element["text"] = element["text"]
-                processed_element["fontSize"] = element.get("fontSize", 20)
-                processed_element["fontFamily"] = element.get("fontFamily", 1)
-                processed_element["textAlign"] = element.get("textAlign", "left")
-                processed_element["verticalAlign"] = element.get("verticalAlign", "top")
-                processed_element["baseline"] = element.get("baseline", 18)
-                processed_element["containerId"] = element.get("containerId", None)
-                processed_element["originalText"] = element.get("originalText", element["text"])
-                processed_element["autoResize"] = element.get("autoResize", True)
-                processed_element["lineHeight"] = element.get("lineHeight", 1.25)
-                processed_elements.append(processed_element)
-            else:
-                processed_elements.append(processed_element)
-
-        # Build the Excalidraw JSON structure
-        excalidraw_data = {
-            "type": "excalidraw",
-            "version": 2,
-            "source": "https://github.com/zsviczian/obsidian-excalidraw-plugin",
-            "elements": processed_elements,
-            "appState": appState,
-            "files": {}
-        }
-
-        # Build frontmatter YAML
-        frontmatter_lines = ["---"]
-        for key, value in final_frontmatter.items():
-            if isinstance(value, list):
-                frontmatter_lines.append(f"{key}:")
-                for item in value:
-                    frontmatter_lines.append(f"  - {item}")
-            elif isinstance(value, bool):
-                frontmatter_lines.append(f"{key}: {str(value).lower()}")
-            else:
-                frontmatter_lines.append(f"{key}: {value}")
-        frontmatter_lines.append("---")
-        
-        # Build complete note content
-        note_parts = [
-            "\n".join(frontmatter_lines),
-            "",
-            "==⚠ Switch to EXCALIDRAW VIEW in the MORE OPTIONS menu of this document. ⚠==",
-            "",
-            "# Excalidraw Data",
-            "",
-            "## Text Elements",
-            text_elements if text_elements else "",
-            "%%",
-            "## Drawing",
-            "```json",
-            json.dumps(excalidraw_data, indent="\t", ensure_ascii=False),
-            "```",
-            "%%"
-        ]
-
-        return "\n".join(note_parts)
+        return filepath
